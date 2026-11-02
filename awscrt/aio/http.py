@@ -379,9 +379,14 @@ class AIOHttpClientStreamUnified(HttpClientStreamBase):
     def _on_body(self, chunk: bytes) -> None:
         """Process body chunk - called from C thread."""
         with self._deque_lock:
-            if self._chunk_futures:
-                future = self._chunk_futures.popleft()
-            else:
+            # Skip readers that were cancelled while waiting. Their futures can no longer take a result.
+            future = None
+            while self._chunk_futures:
+                candidate = self._chunk_futures.popleft()
+                if candidate.set_running_or_notify_cancel():
+                    future = candidate
+                    break
+            if future is None:
                 self._received_chunks.append(chunk)
                 return
 
@@ -401,14 +406,18 @@ class AIOHttpClientStreamUnified(HttpClientStreamBase):
 
         # Set results outside lock (Future is thread-safe)
         for future in pending_futures:
-            future.set_result(b"")
+            # False if the reader was cancelled while waiting
+            if future.set_running_or_notify_cancel():
+                future.set_result(b"")
 
     def _on_complete(self, error_code: int) -> None:
         """Set the completion status of the stream."""
-        if error_code == 0:
-            self._completion_future.set_result(self._status_code)
-        else:
-            self._completion_future.set_exception(awscrt.exceptions.from_code(error_code))
+        # False if wait_for_completion() was cancelled, in which case there is no one to notify
+        if self._completion_future.set_running_or_notify_cancel():
+            if error_code == 0:
+                self._completion_future.set_result(self._status_code)
+            else:
+                self._completion_future.set_exception(awscrt.exceptions.from_code(error_code))
 
         self._resolve_pending_chunk_futures()
 

@@ -9,6 +9,7 @@ import unittest
 import threading
 import subprocess
 import concurrent.futures
+from collections import deque
 from urllib.parse import urlparse
 from test import NativeResourceTest
 import ssl
@@ -19,7 +20,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from awscrt import io
 from awscrt.io import ClientBootstrap, ClientTlsContext, DefaultHostResolver, EventLoopGroup, TlsContextOptions, TlsCipherPref
 from awscrt.http import HttpHeaders, HttpRequest, HttpVersion, Http2Setting, Http2SettingID
-from awscrt.aio.http import AIOHttpClientConnection, AIOHttp2ClientConnection
+from awscrt.aio.http import AIOHttpClientConnection, AIOHttp2ClientConnection, AIOHttpClientStream
 import threading
 
 
@@ -972,6 +973,81 @@ class AIOHttp2RemoteEndStreamTest(AsyncMockServerTestBase):
     def test_h2_remote_end_stream_ordering(self):
         """Test callback ordering with early server response"""
         asyncio.run(self._test_h2_remote_end_stream_ordering())
+
+
+class TestAsyncStreamCancelledReaders(unittest.TestCase):
+    """Callbacks that arrive after an awaiting reader was cancelled must not raise.
+
+    The callbacks are invoked directly, the way the CRT does from its event loop thread,
+    on a stream that has no native connection behind it."""
+
+    def _make_stream(self):
+        stream = AIOHttpClientStream.__new__(AIOHttpClientStream)
+        stream._deque_lock = threading.Lock()
+        stream._chunk_futures = deque()
+        stream._received_chunks = deque()
+        stream._completion_future = concurrent.futures.Future()
+        stream._remote_completion_future = concurrent.futures.Future()
+        stream._status_code = 200
+        return stream
+
+    def _add_reader(self, stream):
+        reader = concurrent.futures.Future()
+        stream._chunk_futures.append(reader)
+        return reader
+
+    def test_body_chunk_is_buffered_when_reader_was_cancelled(self):
+        stream = self._make_stream()
+        reader = self._add_reader(stream)
+        reader.cancel()
+
+        stream._on_body(b"chunk")
+
+        self.assertEqual(0, len(stream._chunk_futures))
+        self.assertEqual([b"chunk"], list(stream._received_chunks))
+        self.assertEqual(b"chunk", asyncio.run(stream.get_next_response_chunk()))
+
+    def test_body_chunk_goes_to_next_live_reader(self):
+        stream = self._make_stream()
+        cancelled_reader = self._add_reader(stream)
+        live_reader = self._add_reader(stream)
+        cancelled_reader.cancel()
+
+        stream._on_body(b"chunk")
+
+        self.assertEqual(b"chunk", live_reader.result(timeout=0))
+        self.assertEqual(0, len(stream._received_chunks))
+
+    def test_complete_resolves_live_readers_and_ignores_cancelled_ones(self):
+        stream = self._make_stream()
+        cancelled_reader = self._add_reader(stream)
+        live_reader = self._add_reader(stream)
+        cancelled_reader.cancel()
+
+        stream._on_complete(0)
+
+        self.assertEqual(b"", live_reader.result(timeout=0))
+        self.assertEqual(200, stream._completion_future.result(timeout=0))
+
+    def test_complete_with_cancelled_completion_waiter(self):
+        stream = self._make_stream()
+        live_reader = self._add_reader(stream)
+        stream._completion_future.cancel()
+
+        stream._on_complete(0)
+
+        self.assertTrue(stream._completion_future.cancelled())
+        self.assertEqual(b"", live_reader.result(timeout=0))
+
+    def test_remote_end_stream_ignores_cancelled_readers(self):
+        stream = self._make_stream()
+        cancelled_reader = self._add_reader(stream)
+        live_reader = self._add_reader(stream)
+        cancelled_reader.cancel()
+
+        stream._on_h2_remote_end_stream()
+
+        self.assertEqual(b"", live_reader.result(timeout=0))
 
 
 if __name__ == '__main__':
